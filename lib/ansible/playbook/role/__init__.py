@@ -35,8 +35,8 @@ from ansible.plugins.loader import add_all_plugin_dirs
 from ansible.utils.collection_loader import AnsibleCollectionConfig
 from ansible.utils.vars import combine_vars
 
-
 __all__ = ['Role', 'hash_params']
+
 
 # TODO: this should be a utility function, but can't be a member of
 #       the role due to the fact that it would require the use of self
@@ -120,6 +120,8 @@ class Role(Base, Conditional, Taggable, CollectionSearch):
             from_files = {}
         self._from_files = from_files
 
+        self._argument_specs = dict()
+
         # Indicates whether this role was included via include/import_role
         self.from_include = from_include
 
@@ -135,7 +137,6 @@ class Role(Base, Conditional, Taggable, CollectionSearch):
 
     @staticmethod
     def load(role_include, play, parent_role=None, from_files=None, from_include=False):
-
         if from_files is None:
             from_files = {}
         try:
@@ -251,7 +252,55 @@ class Role(Base, Conditional, Taggable, CollectionSearch):
             if 'ansible.builtin' not in self.collections and 'ansible.legacy' not in self.collections:
                 self.collections.append(default_append_collection)
 
+        # The argument_specs file will contain a dict, and can have multiple keys,
+        # included a 'main' item. But set one up explicitly if the yaml doesnt provide
+        # one. Could also do things like 'pick the first one' or try to match role name or
+        # 'from_tasks' filename to argument_spec keys, etc
+        argument_specs = {'main': {}}
+        try:
+            argument_specs = self._load_role_yaml('meta', main='argument_specs')
+        except AnsibleParserError as e:
+            pass
+
+        # TODO: need a playbook.base.Base derived object here?
+        # TODO: do we want a Role (or Task or Base) object to have a arg_spec attribute?
+        #       Seems like it would be handy for introspection and error reporting and copy()
+        self._argument_specs = argument_specs
+
         task_data = self._load_role_yaml('tasks', main=self._from_files.get('tasks'))
+
+        # If the the include role is from a task in a from_tasks file,
+        # try to use the argument_spec named based on the from_tasks file file name
+        # first, then fallback to trying 'main'
+        argument_spec_names = []
+        if self._from_files.get('tasks'):
+            argument_spec_names.append(self._from_files.get('tasks'))
+        argument_spec_names.append('main')
+
+        argument_spec = None
+        if argument_specs:
+            for argument_spec_name in argument_spec_names:
+                argument_spec = argument_specs.get(argument_spec_name, None)
+                if argument_spec:
+                    break
+
+        if argument_spec:
+            arg_spec_validation_task = \
+                self._create_arg_spec_validation_task_data(argument_spec,
+                                                           argument_spec_name,
+                                                           role_name=self._role_name,
+                                                           role_path=self._role_path,
+                                                           role_params=self._role_params)
+
+            # Prepend our validate_arg_spec action to happen before any tasks provided by the role.
+            # 'any tasks' can and does include 0 or None tasks, in which cases we create a list of tasks and add our
+            # validate_arg_spec task
+
+            if not task_data:
+                task_data = []
+
+            task_data.insert(0, arg_spec_validation_task)
+
         if task_data:
             try:
                 self._task_blocks = load_list_of_blocks(task_data, play=self._play, role=self, loader=self._loader, variable_manager=self._variable_manager)
@@ -270,6 +319,7 @@ class Role(Base, Conditional, Taggable, CollectionSearch):
 
     def _load_role_yaml(self, subdir, main=None, allow_dir=False):
         file_path = os.path.join(self._role_path, subdir)
+
         if self._loader.path_exists(file_path) and self._loader.is_directory(file_path):
             # Valid extensions and ordering for roles is hard-coded to maintain
             # role portability
@@ -309,6 +359,31 @@ class Role(Base, Conditional, Taggable, CollectionSearch):
                 deps.append(r)
 
         return deps
+
+    def _create_arg_spec_validation_task_data(self, argument_spec, argument_spec_name,
+                                              role_name, role_path, role_params):
+        # If the arg spec provides a description, use it to flesh out the validation task name
+        task_name_parts = ["Validating arguments against arg spec '%s'" % argument_spec_name]
+        if 'description' in argument_spec:
+            task_name_parts.append(argument_spec['description'])
+        task_name = ' - '.join(task_name_parts)
+
+        arg_spec_task = {'action': {'module': 'validate_arg_spec',
+                                    'argument_spec': argument_spec,
+                                    'provided_arguments': role_params,
+                                    'validate_args_context': {'type': 'role',
+                                                              'name': role_name,
+                                                              'argument_spec_name': argument_spec_name,
+                                                              'path': role_path},
+                                    },
+                         'name': task_name,
+                         # TODO: use ignore_error from include_role for the validate task?
+                         # 'ignore_errors': ignore_errors,
+                         # 'vars': {'argument_spec': []},
+                         # 'async_val': async_val,
+                         # 'poll': poll},
+                         }
+        return arg_spec_task
 
     # other functions
 
@@ -424,7 +499,6 @@ class Role(Base, Conditional, Taggable, CollectionSearch):
         Returns true if this role has been iterated over completely and
         at least one task was run
         '''
-
         return host.name in self._completed and not self._metadata.allow_duplicates
 
     def compile(self, play, dep_chain=None):
@@ -437,7 +511,6 @@ class Role(Base, Conditional, Taggable, CollectionSearch):
         with each task, so tasks know by which route they were found, and
         can correctly take their parent's tags/conditionals into account.
         '''
-
         block_list = []
 
         # update the dependency chain here
@@ -473,6 +546,9 @@ class Role(Base, Conditional, Taggable, CollectionSearch):
 
         if self._metadata:
             res['_metadata'] = self._metadata.serialize()
+
+        if self._argument_specs:
+            res['_argument_specs'] = self._argument_specs
 
         if include_deps:
             deps = []
@@ -517,6 +593,10 @@ class Role(Base, Conditional, Taggable, CollectionSearch):
             m = RoleMetadata()
             m.deserialize(metadata_data)
             self._metadata = m
+
+        argument_specs = data.get('_argument_specs', {})
+        if argument_specs:
+            self._argument_specs = argument_specs
 
         super(Role, self).deserialize(data)
 
